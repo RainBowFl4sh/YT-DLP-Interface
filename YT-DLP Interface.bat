@@ -24,7 +24,7 @@ exit /b %errorlevel%
 #  Single file: the batch header above starts this PowerShell part.
 # =====================================================================
 $ErrorActionPreference = 'Continue'
-$script:Version = '2.3'
+$script:Version = '2.3.1'
 
 # The batch header passes the path of this file, the script itself is run from memory
 $Root = $PSScriptRoot
@@ -1788,6 +1788,19 @@ function Download-File([string]$Url, [string]$Dest, [string]$Label) {
     }
 }
 
+# Replaces $Dest with $Src. A plain overwrite is denied by Windows when $Dest is hidden or read-only.
+function Move-OverFile([string]$Src, [string]$Dest) {
+    $hidden = $false
+    if ([IO.File]::Exists($Dest)) {
+        $attr = [IO.File]::GetAttributes($Dest)
+        $hidden = [bool]($attr -band [IO.FileAttributes]::Hidden)
+        [IO.File]::SetAttributes($Dest, [IO.FileAttributes]::Normal)
+        try { [IO.File]::Delete($Dest) } catch { [IO.File]::SetAttributes($Dest, $attr); throw }
+    }
+    [IO.File]::Move($Src, $Dest)
+    if ($hidden) { [IO.File]::SetAttributes($Dest, ([IO.File]::GetAttributes($Dest) -bor [IO.FileAttributes]::Hidden)) }
+}
+
 function Expand-ZipPick([string]$Zip, [hashtable]$Map) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $z = [IO.Compression.ZipFile]::OpenRead($Zip)
@@ -1796,8 +1809,19 @@ function Expand-ZipPick([string]$Zip, [hashtable]$Map) {
         foreach ($e in $z.Entries) {
             foreach ($pat in @($Map.Keys)) {
                 if ($e.FullName -like $pat) {
-                    [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $Map[$pat], $true)
-                    $count++
+                    $target = $Map[$pat]
+                    $tmp = $target + '.download'
+                    try {
+                        [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $tmp, $true)
+                        Move-OverFile $tmp $target
+                        $count++
+                    } catch {
+                        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                        # an existing file that cannot be replaced (in use) must not stop the other files
+                        if (-not (Test-Path -LiteralPath $target)) { throw }
+                        W ('  Kept the existing ' + (Split-Path -Leaf $target) + ' - it could not be replaced.') 'Yellow'
+                        $count++
+                    }
                 }
             }
         }
@@ -1896,8 +1920,12 @@ function Install-YtDlp {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         return $false
     }
-    try { Move-Item -LiteralPath $tmp -Destination $dest -Force -ErrorAction Stop }
-    catch { W ('  Could not save the file: ' + $_.Exception.Message) 'Red'; return $false }
+    try { Move-OverFile $tmp $dest }
+    catch {
+        W ('  Could not save the file: ' + $_.Exception.Message) 'Red'
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        return $false
+    }
     W ('  yt-dlp installed in ' + $dir) 'Green'
     Add-ToPath $dir
     return $true
