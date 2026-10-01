@@ -86,6 +86,17 @@ The built-in help (main menu → `H` → Troubleshooting) covers the common case
 missing JavaScript runtime, age-restricted videos, errors 403 / 429, failing GPU encoding
 and strange symbols instead of boxes.
 
+## Changelog
+
+### 2.3.1 (hotfix)
+
+- **Fixed:** the setup failed with `Access to the path '...\tools\ffmpeg.exe' is denied` when
+  an existing `ffmpeg.exe` or `ffprobe.exe` was marked hidden or read-only. Windows refuses to
+  overwrite such files, so a missing `ffprobe.exe` could not be installed.
+- **Fixed:** the same problem when the setup replaced an existing `yt-dlp.exe`.
+- **Improved:** a tool that cannot be replaced because it is currently running no longer aborts
+  the setup. The existing file is kept and the remaining files are still installed.
+
 ## Disclaimer
 
 This project is not affiliated with yt-dlp, FFmpeg or any video platform. Only download
