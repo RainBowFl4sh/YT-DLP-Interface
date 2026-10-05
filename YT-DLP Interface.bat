@@ -14,9 +14,10 @@ if "%USE_PS7%"=="1" (
 )
 
 :: This file is batch and PowerShell in one: everything below this header is the program.
+:: Start and exit stay on ONE line: cmd has read that line completely before it runs it,
+:: so the built-in update can replace this file while the program is running.
 set "YTDLP_UI_SELF=%~f0"
-"%PSEXE%" -NoProfile -ExecutionPolicy Bypass -Command ". ([ScriptBlock]::Create([IO.File]::ReadAllText($env:YTDLP_UI_SELF, [Text.Encoding]::UTF8)))"
-exit /b %errorlevel%
+"%PSEXE%" -NoProfile -ExecutionPolicy Bypass -Command ". ([ScriptBlock]::Create([IO.File]::ReadAllText($env:YTDLP_UI_SELF, [Text.Encoding]::UTF8)))" & exit /b
 #>
 # =====================================================================
 #  YT-DLP Universal Downloader v2
@@ -24,7 +25,10 @@ exit /b %errorlevel%
 #  Single file: the batch header above starts this PowerShell part.
 # =====================================================================
 $ErrorActionPreference = 'Continue'
-$script:Version = '2.3.1'
+$script:Version = '2.5'
+# GitHub repository ("owner/name") whose releases are checked for a new program version.
+# Empty = the update check is switched off.
+$script:UpdateRepo = 'RainBowFl4sh/YT-DLP-Interface'
 
 # The batch header passes the path of this file, the script itself is run from memory
 $Root = $PSScriptRoot
@@ -117,7 +121,7 @@ function Get-Defaults {
         Metadata       = $true
         SponsorBlock   = $false
         Playlist       = $false
-        Encoder        = 'auto'       # auto | nvenc | amd | cpu
+        Encoder        = 'auto'       # auto (fastest) | nvenc | amd | cpu | both (GPU and CPU, two videos at once)
         RateLimit      = ''
         CookiesBrowser = ''
         RestrictNames  = $true
@@ -128,6 +132,8 @@ function Get-Defaults {
         SetupPending   = $true       # run the first-run setup on the next start
         AutoBenchmark  = $true       # speed test on first start and when the hardware changes
         CookieFileMode = 'patreon'   # patreon | always | never  (when cookies.txt is used)
+        SelfUpdate     = $true       # look for a new program version on GitHub at every start
+        SkipUpdate     = ''          # release tag the user does not want to be asked about again
     }
 }
 function Copy-Dict($d) {
@@ -197,15 +203,28 @@ function Test-Enc([string]$Enc) {
     return ($LASTEXITCODE -eq 0)
 }
 
-function Resolve-Encoder([string]$Pref) {
+function Get-GpuEncoder {
+    if ($script:HasNv)  { return 'NVENC' }
+    if ($script:HasAmd) { return 'AMD' }
+    return ''
+}
+
+# Which encoder a setting means on this PC. "auto" takes the one that was faster in the
+# speed test for that codec; without a test result it prefers the GPU.
+function Resolve-Encoder([string]$Pref, [string]$Codec = 'H.264') {
     switch ($Pref) {
         'nvenc' { return 'NVENC' }
         'amd'   { return 'AMD' }
         'cpu'   { return 'CPU' }
         default {
-            if ($script:HasNv)  { return 'NVENC' }
-            if ($script:HasAmd) { return 'AMD' }
-            return 'CPU'
+            $gpu = Get-GpuEncoder
+            if (-not $gpu) { return 'CPU' }
+            if ($Pref -ne 'both') {
+                $g = Get-BenchX $gpu $Codec
+                $c = Get-BenchX 'CPU' $Codec
+                if ($g -gt 0 -and $c -gt $g) { return 'CPU' }
+            }
+            return $gpu
         }
     }
 }
@@ -229,6 +248,7 @@ function Show-Header([string]$Sub = '') {
     W $G.V 'Cyan'
     W ($G.BL + ($G.H * $inner) + $G.BR) 'Cyan'
     $enc = Resolve-Encoder $script:S.Encoder
+    if ($script:S.Encoder -eq 'both' -and $enc -ne 'CPU') { $enc += ' + CPU' }
     $yv = $script:VerYt
     if (-not $yv) { $yv = 'MISSING' }
     W (" yt-dlp {0}  |  ffmpeg {1}  |  Encoder: {2}" -f $yv, $script:VerFf, $enc) 'DarkGray'
@@ -243,7 +263,6 @@ $script:streamTotal = 1
 $script:streamCur   = 0
 $script:lastExit    = 0
 $script:lastErr     = ''
-$script:ffExit      = 0
 $script:seenWarn    = @{}
 
 function Format-Bar([double]$Pct, [int]$Width = 30) {
@@ -258,9 +277,13 @@ function Format-Time([double]$Seconds) {
     if ($t.TotalHours -ge 1) { return ('{0}:{1:00}:{2:00}' -f [int][Math]::Floor($t.TotalHours), $t.Minutes, $t.Seconds) }
     return ('{0:00}:{1:00}' -f $t.Minutes, $t.Seconds)
 }
-function Show-Progress([string]$Label, [double]$Pct, [string]$Info) {
-    $bar  = Format-Bar $Pct
+function Show-Progress([string]$Label, [double]$Pct, [string]$Info, [string]$Suffix = '') {
+    # a suffix (state of the background converter) needs room, so the bar gets shorter
+    $bw = 30
+    if ($Suffix) { $bw = 20 }
+    $bar  = Format-Bar $Pct $bw
     $text = '  {0} [{1}] {2,5:N1}%  {3}' -f $Label.PadRight(11), $bar, $Pct, $Info
+    if ($Suffix) { $text += '  ' + $Suffix }
     $w = Get-Width
     if ($text.Length -gt $w) { $text = $text.Substring(0, $w) }
     Write-Host ("`r" + $text.PadRight($w)) -NoNewline -ForegroundColor Green
@@ -295,6 +318,7 @@ function Invoke-YtDlp([string[]]$YtArgs) {
     & $ytdlp @all 2>&1 | ForEach-Object {
         $isErr = $_ -is [System.Management.Automation.ErrorRecord]
         $line  = ("$_") -replace '\x1b\[[0-9;]*m', ''
+        Update-Converter
 
         if ($line -match '^PROG\|') {
             $p   = $line.Split('|')
@@ -310,7 +334,7 @@ function Invoke-YtDlp([string[]]$YtArgs) {
                 $speed = ''; $eta = ''
                 if ($p.Length -gt 3) { $speed = $p[3].Trim() }
                 if ($p.Length -gt 4) { $eta   = $p[4].Trim() }
-                Show-Progress $label $pct ("$speed  ETA $eta")
+                Show-Progress $label $pct ("$speed  ETA $eta") (Get-ConverterStatus)
                 if ($p[1] -eq 'finished') { End-Progress }
             }
         } else {
@@ -408,76 +432,238 @@ function Get-EncArgs($prof, [string]$Enc) {
 }
 
 # ---------------------------------------------------------------------
-# ffmpeg runner with conversion bar
+# Background converter
+# ffmpeg runs as its own process, so the next download can start while a
+# finished one is still being converted. Normally one conversion runs at
+# a time; with the encoder setting "both" two run side by side, one on
+# the GPU and one on the CPU. Further files wait in a queue.
+# Update-Converter has to be called regularly (download loop, wait loop)
+# to keep it moving.
 # ---------------------------------------------------------------------
-function Invoke-FfmpegConvert([string[]]$FfArgs, [double]$Dur) {
-    $script:cur   = 0.0
-    $script:speed = ''
-    $script:ffExit = 0
-    $sw = [Diagnostics.Stopwatch]::StartNew()
+$script:ConvQueue = New-Object System.Collections.Queue
+$script:ConvSlots = New-Object System.Collections.ArrayList   # conversions that are running now
+$script:ConvMax   = 1                                          # how many may run side by side
+$script:ConvPoll  = [Diagnostics.Stopwatch]::StartNew()
 
-    & $ffmpeg @FfArgs 2>&1 | ForEach-Object {
-        if ($_ -is [System.Management.Automation.ErrorRecord]) {
-            Write-Line ('  ' + "$_") 'Red'
-            return
-        }
-        $l = "$_"
-        if ($l -match '^out_time_(us|ms)=(\d+)') {
-            $script:cur = [double]::Parse($matches[2], $inv) / 1000000.0
-        } elseif ($l -match '^speed=\s*([\d.]+)x') {
-            $script:speed = $matches[1] + 'x'
-        } elseif ($l -match '^progress=(\w+)') {
-            $done = ($matches[1] -eq 'end')
-            if ($Dur -gt 0) {
-                $pct = [Math]::Min(100.0, $script:cur / $Dur * 100.0)
-                if ($done) { $pct = 100.0 }
-                $eta = -1.0
-                if ($pct -gt 1 -and -not $done) { $eta = $sw.Elapsed.TotalSeconds * (100.0 - $pct) / $pct }
-                Show-Progress 'Convert' $pct ("$($script:speed)  ETA $(Format-Time $eta)")
-            } else {
-                $w = Get-Width
-                Write-Host ("`r  Convert  processed " + (Format-Time $script:cur) + "  $($script:speed)").PadRight($w) -NoNewline
-                $script:barActive = $true
-            }
-            if ($done) { End-Progress }
-        }
+# Builds a Windows command line (quotes arguments with spaces, escapes quotes and trailing backslashes)
+function Join-ProcArgs([string[]]$List) {
+    $out = foreach ($a in $List) {
+        if ($a -ne '' -and $a -notmatch '[\s"]') { $a }
+        else { '"' + ($a -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"' }
     }
-    $script:ffExit = $LASTEXITCODE
+    return ($out -join ' ')
 }
 
-function Convert-Video($src, $O) {
+function Write-Conv($t, [string]$Text, [string]$Color = 'Gray') {
+    Write-Line ('  ' + $t.Tag + $Text) $Color
+}
+
+function Add-ConvertTask($res, $src, $O, [int]$Index, [int]$Total, $sw) {
+    $t = @{ Res = $res; Src = $src; O = $O; Sw = $sw; Tag = ''; Label = 'Convert'; Num = 0; Enc = ''; Done = $false
+            Proc = $null; Cur = 0.0; Speed = ''; Dur = 0.0 }
+    if ($Total -gt 1) { $t.Tag = "[#$Index] "; $t.Label = "Convert #$Index"; $t.Num = $Index }
+    $script:ConvQueue.Enqueue($t)
+    Update-Converter -Now
+}
+
+function Start-ConvertTask($t) {
+    $src  = $t.Src
     $info = Get-StreamInfo $src.FullName
-    $prof = Get-Profile $info ([int]$O.Resolution)
-    $fpsText = '{0:N0}' -f $info.Fps
-    W ("  Source : {0}x{1}, {2} fps, video {3}, audio {4}" -f $info.Width, $info.Height, $fpsText, $info.VCodec, $info.ACodec) 'DarkGray'
+    $t.Prof = Get-Profile $info ([int]$t.O.Resolution)
+    Write-Conv $t ("Source : {0}x{1}, {2:N0} fps, video {3}, audio {4}" -f $info.Width, $info.Height, $info.Fps, $info.VCodec, $info.ACodec) 'DarkGray'
 
-    $copyVideo = ($O.Mode -eq 'fast' -and $info.VCodec -eq 'h264')
-    $enc = Resolve-Encoder $O.Encoder
-    $out = Join-Path $src.DirectoryName (($src.BaseName -replace '_original$', '') + '.mp4')
-    $dur = $info.Duration
-    if ($dur -le 0) { $dur = Get-Duration $src.FullName }
+    $t.CopyVideo = ($t.O.Mode -eq 'fast' -and $info.VCodec -eq 'h264')
+    $t.Out = Join-Path $src.DirectoryName (($src.BaseName -replace '_original$', '') + '.mp4')
+    $t.Dur = $info.Duration
+    if ($t.Dur -le 0) { $t.Dur = Get-Duration $src.FullName }
+    if ($info.ACodec -eq 'aac') { $t.Audio = @('-c:a', 'copy') } else { $t.Audio = @('-c:a', 'aac', '-b:a', '192k') }
 
-    if ($info.ACodec -eq 'aac') { $a = @('-c:a', 'copy') } else { $a = @('-c:a', 'aac', '-b:a', '192k') }
-
-    $attempts = @($enc)
-    if ((-not $copyVideo) -and $enc -ne 'CPU') { $attempts += 'CPU' }
-
-    foreach ($e in $attempts) {
-        if ($copyVideo) {
-            $v = @('-c:v', 'copy'); $pix = @(); $desc = 'video copy, no re-encode'
-        } else {
-            $ea = Get-EncArgs $prof $e
-            $v = $ea.V; $desc = $ea.Desc; $pix = @('-pix_fmt', 'yuv420p')
-        }
-        W ("  [2/2] Converting to MP4 - {0} - {1}" -f $prof.Tier, $desc) 'White'
-        $ffArgs = @('-y', '-hide_banner', '-loglevel', 'error', '-nostdin', '-i', $src.FullName) + $v + $pix + $a +
-                  @('-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', $out)
-        Invoke-FfmpegConvert $ffArgs $dur
-        if ($script:ffExit -eq 0 -and (Test-Path -LiteralPath $out)) { return $out }
-        Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue
-        if (-not $copyVideo -and $e -ne 'CPU') { W '  GPU encoding failed - retrying on the CPU...' 'Yellow' }
+    $codec = 'H.264'
+    if ($t.Prof.Codec -eq 'hevc') { $codec = 'HEVC' }
+    $enc = Resolve-Encoder $t.O.Encoder $codec
+    if ($t.O.Encoder -eq 'both') {
+        # the GPU takes one video, the CPU the other one
+        $gpu = Get-GpuEncoder
+        $gpuBusy = @($script:ConvSlots | Where-Object { $_.Enc -eq $gpu -and $_.Src.FullName -ne $src.FullName }).Count -gt 0
+        if ($gpu -and -not $gpuBusy) { $enc = $gpu } else { $enc = 'CPU' }
     }
-    return $null
+    $t.Attempts = @($enc)
+    if ((-not $t.CopyVideo) -and $enc -ne 'CPU') { $t.Attempts += 'CPU' }
+    $t.Try = 0
+    Start-ConvertAttempt $t
+}
+
+function Start-ConvertAttempt($t) {
+    if ($t.CopyVideo) {
+        $v = @('-c:v', 'copy'); $pix = @(); $desc = 'video copy, no re-encode'
+        $t.Enc = 'COPY'
+    } else {
+        $t.Enc = $t.Attempts[$t.Try]
+        $ea = Get-EncArgs $t.Prof $t.Enc
+        $v = $ea.V; $desc = $ea.Desc; $pix = @('-pix_fmt', 'yuv420p')
+    }
+    Write-Conv $t ("Converting to MP4 - {0} - {1}" -f $t.Prof.Tier, $desc) 'White'
+    # ffmpeg writes its progress into a file, the program reads the end of that file
+    $t.ProgFile = Join-Path $env:TEMP ('ytdlp_conv_' + [guid]::NewGuid().ToString('N') + '.txt')
+    $ffArgs = @('-y', '-hide_banner', '-loglevel', 'error', '-nostdin', '-i', $t.Src.FullName) + $v + $pix + $t.Audio +
+              @('-movflags', '+faststart', '-progress', $t.ProgFile, '-nostats', $t.Out)
+    $t.Cur = 0.0
+    $t.Speed = ''
+    $t.StartError = ''
+    $t.Timer = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $ffmpeg
+        $psi.Arguments = Join-ProcArgs $ffArgs
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardError = $true
+        $t.Proc = [Diagnostics.Process]::Start($psi)
+        $t.ErrTask = $t.Proc.StandardError.ReadToEndAsync()
+    } catch {
+        $t.Proc = $null
+        $t.StartError = $_.Exception.Message
+    }
+}
+
+function Read-ConvProgress($t) {
+    $txt = ''
+    try {
+        $fs = New-Object System.IO.FileStream($t.ProgFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            $n = [int][Math]::Min(600, $fs.Length)
+            if ($n -le 0) { return }
+            [void]$fs.Seek(-$n, [IO.SeekOrigin]::End)
+            $buf = New-Object byte[] $n
+            $got = $fs.Read($buf, 0, $n)
+            $txt = [Text.Encoding]::ASCII.GetString($buf, 0, $got)
+        } finally { $fs.Dispose() }
+    } catch { return }
+    $m = [regex]::Matches($txt, 'out_time_(?:us|ms)=(\d+)')
+    if ($m.Count -gt 0) { $t.Cur = [double]::Parse($m[$m.Count - 1].Groups[1].Value, $inv) / 1000000.0 }
+    $m = [regex]::Matches($txt, 'speed=\s*([\d.]+)x')
+    if ($m.Count -gt 0) { $t.Speed = $m[$m.Count - 1].Groups[1].Value + 'x' }
+}
+
+function Get-ConvPct($t) {
+    if ($t.Dur -le 0) { return 0.0 }
+    return [Math]::Min(99.9, $t.Cur / $t.Dur * 100.0)
+}
+
+# Short state of the converter, shown behind the download bar
+function Get-ConverterStatus {
+    if ($script:ConvSlots.Count -eq 0) { return '' }
+    $s = '| Convert'
+    foreach ($t in @($script:ConvSlots)) {
+        if ($t.Num -gt 0) { $s += " #$($t.Num)" }
+        if ($t.Dur -gt 0) { $s += (' {0:N0}%' -f (Get-ConvPct $t)) }
+    }
+    if ($script:ConvQueue.Count -gt 0) { $s += " +$($script:ConvQueue.Count)" }
+    return $s
+}
+
+function Complete-ConvertTask($t) {
+    $src = $t.Src
+    # give subtitles / thumbnails the final name
+    Get-ChildItem -LiteralPath $src.DirectoryName -File |
+        Where-Object { $_.Name.StartsWith($src.BaseName + '.') -and $_.FullName -ne $src.FullName -and $_.Extension -in @('.srt', '.vtt', '.jpg', '.jpeg', '.png', '.webp') } |
+        ForEach-Object {
+            # only strip the "_original" marker, not the same text inside a title
+            $newPath = Join-Path $_.DirectoryName (($src.BaseName -replace '_original$', '') + $_.Name.Substring($src.BaseName.Length))
+            Move-Item -LiteralPath $_.FullName -Destination $newPath -Force -ErrorAction SilentlyContinue
+        }
+    if (-not $t.O.KeepOriginal) {
+        Remove-Item -LiteralPath $src.FullName -Force -ErrorAction SilentlyContinue
+    } else {
+        Write-Conv $t ('Original kept: ' + $src.Name) 'DarkGray'
+    }
+    $it = Get-Item -LiteralPath $t.Out
+    $t.Res.Ok   = $true
+    $t.Res.File = $t.Out
+    $t.Res.Size = $it.Length
+    Write-Conv $t ('Saved  : ' + $t.Out) 'Green'
+    Write-Conv $t ('Size   : {0:N1} MB     Time: {1}' -f ($it.Length / 1MB), (Format-Time $t.Sw.Elapsed.TotalSeconds)) 'Green'
+}
+
+# Called when the ffmpeg process of the current task has ended (or could not be started)
+function Complete-ConvertAttempt($t) {
+    $code = -1
+    $errText = $t.StartError
+    if ($t.Proc) {
+        try {
+            $t.Proc.WaitForExit()
+            $code = $t.Proc.ExitCode
+            $errText = "$($t.ErrTask.Result)"
+        } catch { }
+        $t.Proc.Dispose()
+        $t.Proc = $null
+    }
+    Remove-Item -LiteralPath $t.ProgFile -Force -ErrorAction SilentlyContinue
+
+    if ($code -eq 0 -and (Test-Path -LiteralPath $t.Out)) {
+        Complete-ConvertTask $t
+        Add-History $t.Res $t.O.Type
+        $t.Done = $true
+        return
+    }
+    Remove-Item -LiteralPath $t.Out -Force -ErrorAction SilentlyContinue
+    foreach ($l in @("$errText" -split '\r?\n' | Where-Object { $_.Trim() } | Select-Object -Last 4)) {
+        Write-Conv $t (Limit-Text $l.Trim() 110) 'Red'
+    }
+    $t.Try++
+    if ($t.Try -lt $t.Attempts.Count) {
+        Write-Conv $t 'GPU encoding failed - retrying on the CPU...' 'Yellow'
+        Start-ConvertAttempt $t
+        return
+    }
+    Write-Conv $t 'FAILED: Conversion failed. The original file was kept.' 'Red'
+    $t.Res.Error = 'Conversion failed.'
+    Add-History $t.Res $t.O.Type
+    $t.Done = $true
+}
+
+# Moves the converter on: reads the progress, finishes an ended conversion, starts the next one
+function Update-Converter([switch]$Now) {
+    if ($script:ConvSlots.Count -eq 0 -and $script:ConvQueue.Count -eq 0) { return }
+    if ((-not $Now) -and $script:ConvPoll.ElapsedMilliseconds -lt 250) { return }
+    $script:ConvPoll.Restart()
+    foreach ($t in @($script:ConvSlots)) {
+        if ($t.Proc -and -not $t.Proc.HasExited) { Read-ConvProgress $t; continue }
+        Complete-ConvertAttempt $t
+        if ($t.Done) { $script:ConvSlots.Remove($t) }
+    }
+    while ($script:ConvSlots.Count -lt $script:ConvMax -and $script:ConvQueue.Count -gt 0) {
+        $t = $script:ConvQueue.Dequeue()
+        [void]$script:ConvSlots.Add($t)
+        Start-ConvertTask $t
+    }
+}
+
+# Shows the conversion bar until the converter is idle,
+# or (with -UntilWaiting N) until at most N files are waiting for it
+function Wait-Converter([int]$UntilWaiting = -1) {
+    while ($true) {
+        Update-Converter -Now
+        if ($script:ConvSlots.Count -eq 0) { break }
+        if ($UntilWaiting -ge 0 -and $script:ConvQueue.Count -le $UntilWaiting) { break }
+        $t = $script:ConvSlots[0]
+        $more = ''
+        if ($script:ConvSlots.Count -gt 1) {
+            $o2 = $script:ConvSlots[1]
+            $more = ('  | #{0} {1:N0}%' -f $o2.Num, (Get-ConvPct $o2))
+        }
+        if ($script:ConvQueue.Count -gt 0) { $more += "  ($($script:ConvQueue.Count) waiting)" }
+        if ($t.Dur -gt 0) {
+            $pct = Get-ConvPct $t
+            $eta = -1.0
+            if ($pct -gt 1) { $eta = $t.Timer.Elapsed.TotalSeconds * (100.0 - $pct) / $pct }
+            Show-Progress $t.Label $pct ("$($t.Speed)  ETA $(Format-Time $eta)$more")
+        } else {
+            Write-Host ("`r  $($t.Label)  processed " + (Format-Time $t.Cur) + "  $($t.Speed)$more").PadRight((Get-Width)) -NoNewline
+            $script:barActive = $true
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    Hide-Progress
 }
 
 # ---------------------------------------------------------------------
@@ -610,12 +796,14 @@ function Read-PathFile([string]$Tmp) {
 
 function New-Fail($res, [string]$Msg) {
     $res.Error = $Msg
-    W ("  FAILED: " + $Msg) 'Red'
+    Write-Line ("  FAILED: " + $Msg) 'Red'
     return $res
 }
 
-function Start-OneDownload([string]$Url, $O, [string]$OutDir, [string]$Prefix) {
-    $res = [pscustomobject]@{ Url = $Url; Ok = $false; File = ''; Size = 0; Error = '' }
+# Downloads one url. A video that still has to be converted is handed to the background
+# converter and comes back with Pending = $true.
+function Start-OneDownload([string]$Url, $O, [string]$OutDir, [string]$Prefix, [int]$Index = 1, [int]$Total = 1) {
+    $res = [pscustomobject]@{ Url = $Url; Ok = $false; File = ''; Size = 0; Error = ''; Pending = $false }
     $sw = [Diagnostics.Stopwatch]::StartNew()
 
     try {
@@ -637,7 +825,7 @@ function Start-OneDownload([string]$Url, $O, [string]$OutDir, [string]$Prefix) {
         W '  Downloading audio...' 'White'
     } elseif ($convert) {
         $a = @('-f', (Get-FormatString $O), '-o', "$OutDir\$Prefix%(title)s_original.%(ext)s")
-        W '  [1/2] Downloading original file...' 'White'
+        W '  Downloading original file...' 'White'
     } else {
         $a = @('-f', (Get-FormatString $O), '-o', "$OutDir\$Prefix%(title)s.%(ext)s")
         W '  Downloading video (no conversion)...' 'White'
@@ -648,7 +836,11 @@ function Start-OneDownload([string]$Url, $O, [string]$OutDir, [string]$Prefix) {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         $m = $script:lastErr
         if (-not $m) { $m = "yt-dlp exit code $($script:lastExit)" }
-        return (New-Fail $res $m)
+        $null = New-Fail $res $m
+        if ($m -match '(?i)cookies|log ?in|sign in|members.only|no access|not have access|private') {
+            Write-Line '  Hint: this usually means login cookies are needed - see main menu [C] Cookies.' 'Yellow'
+        }
+        return $res
     }
 
     $file = Read-PathFile $tmp
@@ -662,37 +854,20 @@ function Start-OneDownload([string]$Url, $O, [string]$OutDir, [string]$Prefix) {
     }
     if (-not $file) { return (New-Fail $res 'Could not locate the downloaded file.') }
 
-    $final = $file
     if ($convert) {
-        $srcItem = Get-Item -LiteralPath $file
-        $out = @(Convert-Video $srcItem $O) | Select-Object -Last 1
-        if (-not $out) {
-            W '  The original file was kept.' 'Yellow'
-            return (New-Fail $res 'Conversion failed.')
-        }
-        # give subtitles / thumbnails the final name
-        Get-ChildItem -LiteralPath $srcItem.DirectoryName -File |
-            Where-Object { $_.Name.StartsWith($srcItem.BaseName + '.') -and $_.FullName -ne $srcItem.FullName -and $_.Extension -in @('.srt', '.vtt', '.jpg', '.jpeg', '.png', '.webp') } |
-            ForEach-Object {
-                # only strip the "_original" marker, not the same text inside a title
-                $newPath = Join-Path $_.DirectoryName (($srcItem.BaseName -replace '_original$', '') + $_.Name.Substring($srcItem.BaseName.Length))
-                Move-Item -LiteralPath $_.FullName -Destination $newPath -Force -ErrorAction SilentlyContinue
-            }
-        if (-not $O.KeepOriginal) {
-            Remove-Item -LiteralPath $srcItem.FullName -Force -ErrorAction SilentlyContinue
-            W '  Original file removed.' 'DarkGray'
-        } else {
-            W ('  Original kept: ' + $srcItem.Name) 'DarkGray'
-        }
-        $final = $out
+        # the conversion runs in the background, its result is written into $res later
+        $res.Pending = $true
+        if ($Index -lt $Total) { Write-Line '  Download finished - it is converted while the next download runs.' 'DarkGray' }
+        Add-ConvertTask $res (Get-Item -LiteralPath $file) $O $Index $Total $sw
+        return $res
     }
 
-    $it = Get-Item -LiteralPath $final
+    $it = Get-Item -LiteralPath $file
     $res.Ok = $true
-    $res.File = $final
+    $res.File = $file
     $res.Size = $it.Length
-    W ('  Saved  : ' + $final) 'Green'
-    W ('  Size   : {0:N1} MB     Time: {1}' -f ($it.Length / 1MB), (Format-Time $sw.Elapsed.TotalSeconds)) 'Green'
+    Write-Line ('  Saved  : ' + $file) 'Green'
+    Write-Line ('  Size   : {0:N1} MB     Time: {1}' -f ($it.Length / 1MB), (Format-Time $sw.Elapsed.TotalSeconds)) 'Green'
     return $res
 }
 
@@ -724,22 +899,40 @@ function Start-Queue([string[]]$Urls, $O) {
         [void]$jobs.Add(@{ Url = $u; Dir = [string]$O.DownloadFolder; Prefix = '' })
     }
 
+    # encoder "both": the GPU and the CPU convert one video each at the same time
+    $script:ConvMax = 1
+    if ($O.Encoder -eq 'both' -and (Get-GpuEncoder)) { $script:ConvMax = 2 }
+
     $results = New-Object System.Collections.ArrayList
     $n = $jobs.Count
     $i = 0
     $total = [Diagnostics.Stopwatch]::StartNew()
     foreach ($j in $jobs) {
         $i++
-        Write-Host ''
+        # do not pile up unconverted originals on the disk when downloads are faster than the converter
+        if ($script:ConvQueue.Count -ge 2) {
+            Write-Line ''
+            Write-Line '  Waiting for the converter to catch up before the next download...' 'DarkGray'
+            Wait-Converter -UntilWaiting 1
+        }
+        Write-Line ''
         if ($n -gt 1) {
             $ov = ($i - 1) / $n * 100
-            W ("  Overall [{0}] {1}/{2} done" -f (Format-Bar $ov 30), ($i - 1), $n) 'Cyan'
+            W ("  Overall [{0}] {1}/{2} downloaded" -f (Format-Bar $ov 30), ($i - 1), $n) 'Cyan'
         }
         W ("  Item {0} of {1}: {2}" -f $i, $n, (Limit-Text $j.Url 70)) 'White'
         Write-Rule
-        $r = @(Start-OneDownload $j.Url $O $j.Dir $j.Prefix) | Select-Object -Last 1
+        $r = @(Start-OneDownload $j.Url $O $j.Dir $j.Prefix $i $n) | Select-Object -Last 1
         [void]$results.Add($r)
-        Add-History $r $O.Type
+        if (-not $r.Pending) { Add-History $r $O.Type }
+    }
+    # the last conversions are still running
+    if ($script:ConvSlots.Count -gt 0 -or $script:ConvQueue.Count -gt 0) {
+        if ($n -gt 1) {
+            Write-Line ''
+            Write-Line '  All downloads finished - waiting for the remaining conversions...' 'Cyan'
+        }
+        Wait-Converter
     }
 
     $ok = @($results | Where-Object { $_.Ok }).Count
@@ -773,6 +966,8 @@ $Defs = @(
     @{ Key = '7'; Field = 'Subtitles';    Label = 'Subtitles';          Kind = 'text'; Group = 'Video'; Scope = 'both'; Rel = { param($o) $o.Type -eq 'video' }
        Prompt = 'Language codes, e.g. en  or  de,en   (empty = off)'
        Hint = 'Saved as separate .srt files next to the video (manual subtitles, else auto-generated).' },
+    @{ Key = 'E'; Field = 'Encoder';      Label = 'Encoder';            Kind = 'cycle'; Vals = @('auto', 'nvenc', 'amd', 'cpu', 'both'); Group = 'Video'; Scope = 'both'; Rel = { param($o) $o.Type -eq 'video' -and $o.Mode -ne 'original' }
+       Hint = 'Auto = the fastest encoder of this PC (speed test). NVENC / AMD = graphics card, CPU = processor. GPU + CPU = with several videos two are converted at once, one on each.' },
     @{ Key = '5'; Field = 'AudioFormat';  Label = 'Audio format';       Kind = 'cycle'; Vals = @('mp3', 'm4a', 'opus', 'flac', 'wav'); Group = 'Audio'; Scope = 'both'; Rel = { param($o) $o.Type -eq 'audio' }
        Hint = 'MP3 = most compatible, M4A = AAC, OPUS = best for size, FLAC/WAV = lossless container.' },
     @{ Key = '6'; Field = 'AudioQuality'; Label = 'Audio quality';      Kind = 'cycle'; Vals = @('0', '320K', '256K', '192K', '128K'); Group = 'Audio'; Scope = 'both'; Rel = { param($o) $o.Type -eq 'audio' }
@@ -791,8 +986,6 @@ $Defs = @(
     @{ Key = 'F'; Field = 'DownloadFolder'; Label = 'Download folder';  Kind = 'text'; Group = 'Output'; Scope = 'both'; Rel = { param($o) $true }
        Prompt = 'Full path of the folder (created if missing). Empty = keep current'
        Hint = 'Where the finished files are saved.' },
-    @{ Key = 'E'; Field = 'Encoder';      Label = 'Encoder';            Kind = 'cycle'; Vals = @('auto', 'nvenc', 'amd', 'cpu'); Group = 'Program'; Scope = 'settings'; Rel = { param($o) $true }
-       Hint = 'Auto = best working GPU encoder, else CPU. Force one if auto picks wrong.' },
     @{ Key = 'L'; Field = 'RateLimit';    Label = 'Speed limit';        Kind = 'text'; Group = 'Program'; Scope = 'settings'; Rel = { param($o) $true }
        Prompt = 'Max download speed, e.g. 5M or 800K   (empty = unlimited)'
        Hint = 'Useful if the download slows down your internet.' },
@@ -806,6 +999,8 @@ $Defs = @(
        Hint = 'Plays a short notification sound after the last download.' },
     @{ Key = 'Y'; Field = 'AutoUpdate';   Label = 'Update yt-dlp on start'; Kind = 'bool'; Group = 'Program'; Scope = 'settings'; Rel = { param($o) $true }
        Hint = 'Checks for a new yt-dlp version every time the program starts.' },
+    @{ Key = 'W'; Field = 'SelfUpdate';   Label = 'Check for program updates'; Kind = 'bool'; Group = 'Program'; Scope = 'settings'; Rel = { param($o) $true }
+       Hint = 'Looks on GitHub for a new version of this program at every start. It asks before it installs anything.' },
     @{ Key = 'U'; Field = 'Unicode';      Label = 'Fancy graphics';     Kind = 'bool'; Group = 'Program'; Scope = 'settings'; Rel = { param($o) $true }
        Hint = 'Off = plain ASCII bars and boxes (use this if you see strange symbols).' },
     @{ Key = 'X'; Field = 'SetupPending'; Label = 'Run setup on next start'; Kind = 'bool'; Group = 'Program'; Scope = 'settings'; Rel = { param($o) $true }
@@ -827,7 +1022,12 @@ function Format-Opt([string]$F, $O) {
             return 'Quality (re-encode, optimized)'
         }
         'Encoder'    {
-            if ($v -eq 'auto') { return ('Auto (detected: {0})' -f (Resolve-Encoder 'auto')) }
+            if ($v -eq 'auto') { return ('Auto - fastest (now: {0})' -f (Resolve-Encoder 'auto')) }
+            if ($v -eq 'both') {
+                $gpu = Get-GpuEncoder
+                if ($gpu) { return "GPU + CPU ($gpu and CPU, 2 videos at once)" }
+                return 'GPU + CPU (no GPU encoder found - CPU only)'
+            }
             return ("$v").ToUpper()
         }
         'AudioQuality' { if ("$v" -eq '0') { return 'Best' }; return "$v" }
@@ -1005,13 +1205,14 @@ $HelpOptions = @'
 - Playlist: download every video of a playlist.
 - Time range: download only a part of a video.
 ## Program settings (Settings only)
-- Encoder: auto / NVENC (NVIDIA) / AMD / CPU.
+- Encoder (key E, also on the download screen): Auto = the fastest one, NVENC (NVIDIA), AMD, CPU, or GPU + CPU. See the topic Encoding modes and profiles.
 - Speed limit: e.g. 5M.
 - Cookies from browser: for age restricted, private or members-only videos.
 - cookies.txt usage: use the cookies.txt file only for Patreon links, for all links, or never.
 - Safe file names: ASCII only, or keep the full title with special characters.
 - Open folder / Sound: what happens after the download.
 - Update yt-dlp on start, Fancy graphics.
+- Check for program updates: looks on GitHub for a new version of this program at every start.
 '@
 
 $HelpEncoding = @'
@@ -1028,7 +1229,8 @@ $HelpEncoding = @'
 - Vertical videos (Shorts) are rated by their shorter side.
 ## Encoders
 - NVIDIA = NVENC, AMD = AMF, everything else = CPU (libx264 / libx265, slower).
-- Auto tests your hardware at start. If a GPU encode fails, the program retries on the CPU.
+- Auto uses the encoder that was faster in the speed test (GPU or CPU, checked separately for H.264 and HEVC). Without a speed test result it takes the GPU if one works. If a GPU encode fails, the program retries on the CPU.
+- GPU + CPU: with several videos two are converted at the same time, one on the graphics card and one on the processor. A single video still uses the GPU only. The CPU video is converted slower, and the PC is under full load meanwhile.
 - Audio that is already AAC is copied, everything else becomes AAC 192k.
 !! HEVC files play on nearly every current device. Very old TVs may need H.264 (use Fast mode or max 1080p).
 '@
@@ -1042,6 +1244,11 @@ $HelpBatch = @'
 - Main menu 2: paste several links, or use links.txt (one link per line, lines starting with # are ignored).
 - In the normal link prompt you can also paste several links separated by spaces.
 - All links use the same options.
+## Download and convert at the same time
+- With several links the program does not wait for a conversion: while one video is converted to MP4, the next one is already downloading.
+- The download bar then shows the converter at its end, e.g. | Convert #1 45%. Lines that start with [#1] belong to the conversion of item 1.
+- One conversion runs at a time (two with the encoder setting GPU + CPU). If downloads are much faster than the converter, the program pauses downloading while 2 files wait, so the disk does not fill up with unconverted originals.
+- Audio downloads and Original mode have no separate conversion step, they run one after the other.
 ## Time range
 - Key T on the options screen: START-END, e.g. 1:30-2:45, or 10:00- for until the end.
 - The progress bar may stay empty during a cut download. This is normal.
@@ -1057,6 +1264,7 @@ $HelpFiles = @'
 - links.txt               links for batch mode (main menu 2)
 - cookies.txt             optional login cookies (main menu C helps you create it)
 - cookies.txt.bak         backup of the previous cookies.txt
+- YT-DLP Interface.bat.bak  the previous program version, kept by the program update
 - benchmark.json          cached hardware info and speed test result (Tools menu)
 - tools\                  subfolder with yt-dlp.exe, ffmpeg.exe, ffprobe.exe, deno.exe (installed by the setup)
 ## File names
@@ -1073,10 +1281,16 @@ $HelpTrouble = @'
 ## Video not available / age restricted / members only
 - Settings -> Cookies from browser: choose the browser where you are logged in. Firefox works best. For Chrome / Edge close the browser first.
 - Main menu C (Cookies) explains how to get a cookies.txt and can export or import it for you.
+## Patreon says you have no access
+- Patreon needs your login cookies, also for posts you have unlocked. Without a cookies.txt the program warns you before the download and leads you to the Cookies menu.
+- Get the file with main menu C: automatic export from your browser, or the add-on Get cookies.txt LOCALLY (Chrome, Edge, Brave) / cookies.txt (Firefox) and then Import.
 ## Errors 403 or 429
 - Update yt-dlp (Tools -> Update), try again later, or set a speed limit.
 ## GPU encoding fails
 - Update your graphics driver. The program falls back to the CPU automatically.
+## Program update
+- At every start the program asks GitHub for the newest release. If there is one it shows the changes and asks: Y installs it and restarts, N asks again next time, S skips that version.
+- The old program file is kept as YT-DLP Interface.bat.bak. Switch the check off in Settings (key W), or run it by hand with Tools -> U.
 ## Strange symbols instead of bars and boxes
 - Settings -> Fancy graphics: switch to No.
 ## A download says it finished but the file is missing
@@ -1709,9 +1923,11 @@ function Menu-Tools {
         Write-Item '7' 'Cookies (guide, automatic export, import)'
         Write-Item '8' 'PC rating for converting video and audio'
         Write-Item '9' 'Move tools from the program folder into the tools folder'
+        Write-Item 'U' 'Check for a new version of this program'
         Write-Item 'B' 'Back'
         $k = Read-Key
         if ($k -eq 'B' -or $k -eq 'ESC') { return }
+        if ($k -eq 'U') { W ''; Test-ProgramUpdate -Manual; Wait-Key }
         if ($k -eq '1') {
             W ''
             if ($ytdlp) { & $ytdlp -U } else { W '  yt-dlp is not installed - use Setup (key 5).' 'Yellow' }
@@ -2102,6 +2318,116 @@ function Invoke-Setup {
     Refresh-Tools
 }
 
+# ---------------------------------------------------------------------
+# Program update from the GitHub releases of $script:UpdateRepo
+# ---------------------------------------------------------------------
+function ConvertTo-Version([string]$Text) {
+    $t = ($Text.Trim() -replace '^[vV]', '') -replace '[^0-9.].*$', ''
+    if ($t -notmatch '\.') { $t += '.0' }
+    try { return [version]$t } catch { return $null }
+}
+
+function Get-LatestRelease {
+    if (-not $script:UpdateRepo) { return $null }
+    $oldPref = $ProgressPreference
+    try {
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+        $ProgressPreference = 'SilentlyContinue'
+        $r = Invoke-RestMethod -Uri "https://api.github.com/repos/$($script:UpdateRepo)/releases/latest" -UserAgent 'ytdlp-interface-updater' -TimeoutSec 5 -ErrorAction Stop
+        $tag = [string]$r.tag_name
+        # the version number is taken from the tag (v2.5) or, if the tag is a word, from the release title (v2.5r)
+        $ver = ConvertTo-Version $tag
+        if (-not $ver) { $ver = ConvertTo-Version ([string]$r.name) }
+        if (-not $ver) { return $null }
+        # the .bat attached to the release, else the file from the repository at that tag
+        $asset = @($r.assets | Where-Object { $_.name -like '*.bat' })[0]
+        if ($asset) { $url = [string]$asset.browser_download_url }
+        else { $url = "https://raw.githubusercontent.com/$($script:UpdateRepo)/$tag/YT-DLP%20Interface.bat" }
+        return [pscustomobject]@{ Tag = $tag; Version = $ver; Url = $url; Notes = [string]$r.body }
+    } catch {
+        return $null
+    } finally { $ProgressPreference = $oldPref }
+}
+
+function Restart-Program([string]$Self) {
+    Start-Process -FilePath $Self -WorkingDirectory (Split-Path -Parent $Self)
+    exit
+}
+
+# Downloads the new .bat, checks it and puts it in place of the running one. The old file is kept as .bak
+function Install-ProgramUpdate($rel) {
+    $self = $env:YTDLP_UI_SELF
+    if (-not $self -or -not (Test-Path -LiteralPath $self)) {
+        W '  The update only works when the program was started from its .bat file.' 'Yellow'
+        return $false
+    }
+    $tmp = $self + '.download'
+    if (-not (Download-File $rel.Url $tmp 'Update')) {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    try {
+        # batch files need CRLF line endings, a download from the repository may have LF only
+        $text = [IO.File]::ReadAllText($tmp) -replace "`r?`n", "`r`n"
+        $tok = $null; $err = $null
+        [void][Management.Automation.Language.Parser]::ParseInput($text, [ref]$tok, [ref]$err)
+        $newVer = $null
+        if ($text -match "(?m)^\`$script:Version = '([\d.]+)'") { $newVer = ConvertTo-Version $matches[1] }
+        if (-not $text.StartsWith('<# :') -or $text.Length -lt 50000 -or @($err).Count -gt 0 -or -not $newVer) {
+            throw 'the downloaded file is not a valid program file'
+        }
+        if ($newVer -le (ConvertTo-Version $script:Version)) { throw "the downloaded file is not newer (version $newVer)" }
+        [IO.File]::WriteAllText($tmp, $text, (New-Object System.Text.UTF8Encoding($false)))
+        Copy-Item -LiteralPath $self -Destination ($self + '.bak') -Force -ErrorAction Stop
+        Move-OverFile $tmp $self
+    } catch {
+        W ('  Update failed: ' + $_.Exception.Message) 'Red'
+        W '  Nothing was changed.' 'Yellow'
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    W ("  Version {0} installed. The old file was kept as {1}" -f $newVer, (Split-Path -Leaf ($self + '.bak'))) 'Green'
+    W '  The program restarts now...' 'Green'
+    Start-Sleep -Seconds 2
+    Restart-Program $self
+    return $true
+}
+
+# Looks for a newer release and asks before installing it.
+# At the start it stays silent unless there is something new; -Manual (Tools menu) always answers.
+function Test-ProgramUpdate([switch]$Manual) {
+    if (-not $script:UpdateRepo) {
+        if ($Manual) { W '  No update source is set in this copy of the program.' 'Yellow' }
+        return
+    }
+    $rel = Get-LatestRelease
+    if (-not $rel) {
+        if ($Manual) { W '  Could not read the latest version from GitHub (offline, or no release yet).' 'Yellow' }
+        return
+    }
+    if ($rel.Version -le (ConvertTo-Version $script:Version)) {
+        if ($Manual) { W ("  You already have the newest version ({0})." -f $script:Version) 'Green' }
+        return
+    }
+    if ((-not $Manual) -and $script:S.SkipUpdate -eq $rel.Tag) { return }
+    W ''
+    W ("  A new version is available: {0}   (you have {1})" -f $rel.Version, $script:Version) 'Green'
+    $notes = @($rel.Notes -split '\r?\n' | Where-Object { $_.Trim() } | Select-Object -First 8)
+    foreach ($l in $notes) { W ('   ' + (Limit-Text ($l.Trim() -replace '^#+\s*', '' -replace '[*`]', '') 90)) 'Gray' }
+    W ''
+    Wn '  [Y] ' 'Yellow'; Wn 'Install now    ' 'Gray'
+    Wn '[N] ' 'Yellow'; Wn 'Not now    ' 'Gray'
+    Wn '[S] ' 'Yellow'; W 'Skip this version' 'Gray'
+    $k = Read-Key
+    W ''
+    if ($k -eq 'Y') {
+        if (-not (Install-ProgramUpdate $rel)) { Wait-Key }
+    } elseif ($k -eq 'S') {
+        $script:S['SkipUpdate'] = $rel.Tag
+        Save-Settings
+    }
+}
+
 function Assert-Tools {
     $miss = @()
     if (-not $script:ytdlp)  { $miss += 'yt-dlp' }
@@ -2402,6 +2728,40 @@ function New-DownloadOptions {
     return $o
 }
 
+# Patreon answers "no access" without login cookies. Explains that before the download starts
+# and leads to the Cookies menu. Returns $false when the user cancels.
+function Confirm-Cookies([string[]]$Urls, $O) {
+    while ($true) {
+        $need = @($Urls | Where-Object { $_ -match 'patreon\.com' -and @(Get-CookieArgs $O $_).Count -eq 0 })
+        if ($need.Count -eq 0) { return $true }
+        $unused = (Test-Path -LiteralPath $CookieFile)   # a cookies.txt exists, but its usage is set to Never
+        Show-Header 'Cookies needed'
+        W ''
+        W '  Patreon needs your login cookies.' 'Yellow'
+        W '  Without them Patreon answers "no access", even for posts you have unlocked.' 'Gray'
+        W ''
+        if ($unused) {
+            W '  You have a cookies.txt, but "cookies.txt usage" is set to Never (Settings, key C).' 'Gray'
+        } else {
+            W '  No cookies.txt was found in the program folder. Two ways to get it:' 'Gray'
+            W '   - The Cookies menu can export it from your browser automatically (Firefox works best).' 'Gray'
+            W '   - Or install a browser add-on: "Get cookies.txt LOCALLY" (Chrome, Edge, Brave) or' 'Gray'
+            W '     "cookies.txt" (Firefox). Log in to patreon.com, export there, then import the' 'Gray'
+            W '     file in the Cookies menu.' 'Gray'
+        }
+        W ''
+        if ($unused) { Write-Item 'U' 'Use cookies.txt for this download' }
+        Write-Item 'C' 'Open the Cookies menu'
+        Write-Item 'D' 'Download anyway (will probably fail)'
+        Write-Item 'B' 'Cancel'
+        $k = Read-Key
+        if ($k -eq 'U' -and $unused) { $O['CookieFileMode'] = 'patreon' }
+        if ($k -eq 'C') { $null = Menu-Cookies }
+        if ($k -eq 'D') { return $true }
+        if ($k -eq 'B' -or $k -eq 'ESC') { return $false }
+    }
+}
+
 function Menu-NewDownload {
     if (-not (Assert-Tools)) { return }
     while ($true) {
@@ -2427,7 +2787,7 @@ function Menu-NewDownload {
         }
         $r = Show-Options $O $false $meta
         $script:showMetaFlag = $null
-        if ($r -eq 'start') {
+        if ($r -eq 'start' -and (Confirm-Cookies $urls $O)) {
             Show-Header 'Downloading'
             Start-Queue $urls $O
             Wait-Key
@@ -2473,7 +2833,7 @@ function Menu-Batch {
         W ("  {0} links loaded." -f $urls.Count) 'Cyan'
         Start-Sleep -Milliseconds 600
         $r = Show-Options $O $false $null
-        if ($r -eq 'start') {
+        if ($r -eq 'start' -and (Confirm-Cookies $urls $O)) {
             Show-Header 'Downloading'
             Start-Queue $urls $O
             Wait-Key
@@ -2487,6 +2847,10 @@ function Menu-Batch {
 Clear-Host
 W ''
 W "  YT-DLP DOWNLOADER v$($script:Version) - starting..." 'Cyan'
+if ($script:S.SelfUpdate -and $script:UpdateRepo) {
+    W '  Checking for a new program version...' 'DarkGray'
+    Test-ProgramUpdate
+}
 if ($script:S.SetupPending) {
     Invoke-Setup
     $script:S['SetupPending'] = $false
