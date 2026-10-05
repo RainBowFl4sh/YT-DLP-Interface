@@ -14,6 +14,7 @@ offers to download the tools it needs (yt-dlp, ffmpeg, deno) for you.
   - *Fast* – copy H.264 streams without re-encoding (seconds, no quality loss)
   - *Original* – keep the file exactly as yt-dlp downloads it
 - **GPU encoding** with NVIDIA NVENC or AMD AMF, automatic fallback to the CPU
+- **Encoder choice** – *Auto* picks whatever the speed test found fastest on your PC, or force GPU, CPU, or *GPU + CPU* (two videos are converted at once, one on each)
 - **Audio only** as MP3, M4A, OPUS, FLAC or WAV
 - **Playlists** (each into its own numbered sub folder) and **batch downloads** (paste several links or use `links.txt`)
 - **Download and convert at the same time** – with several links the next download starts while the previous video is still being converted
@@ -21,6 +22,7 @@ offers to download the tools it needs (yt-dlp, ffmpeg, deno) for you.
 - Subtitles, thumbnails, embedded metadata, SponsorBlock
 - **Cookie helper** for age-restricted, private or members-only videos (guide, browser export, import, site filter), with a warning before Patreon downloads when no cookies are set up
 - **PC rating and speed test** – shows how fast your PC converts video and recommends default settings
+- **Built-in update** – checks the GitHub releases at every start and installs a new version after asking
 - Progress bars for download and conversion, download history, built-in help for every option
 
 ## Requirements
@@ -88,6 +90,20 @@ missing JavaScript runtime, age-restricted videos, errors 403 / 429, failing GPU
 and strange symbols instead of boxes.
 
 ## Changelog
+
+### 2.5
+
+- **New: encoder choice.** The *Encoder* option (key `E`, now also on the download screen) offers:
+  - *Auto* – uses the encoder that was faster in the speed test, GPU or CPU, checked separately
+    for H.264 and HEVC. Without a speed test result the GPU is preferred.
+  - *NVENC* / *AMD* / *CPU* – always use that one.
+  - *GPU + CPU* – with several videos two are converted at the same time, one on the graphics
+    card and one on the processor. A single video still uses the GPU only.
+- **New: built-in update.** At every start the program looks for a newer release on GitHub,
+  shows the changes and asks whether to install it (`Y` install and restart, `N` not now,
+  `S` skip this version). The previous file is kept as `YT-DLP Interface.bat.bak`. The check
+  can be switched off in Settings (key `W`) and started by hand with Tools → `U`.
+- The update only works from this version on: 2.4 and older have to be replaced by hand once.
 
 ### 2.4
 

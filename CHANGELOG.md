@@ -2,6 +2,24 @@
 
 All notable changes to YT-DLP Interface are listed here, newest version first.
 
+## 2.5
+
+### New
+- **Encoder choice.** The *Encoder* option (key `E`, now also on the download screen) offers:
+  - *Auto* – uses the encoder that was faster in the speed test, GPU or CPU, checked separately
+    for H.264 and HEVC. Without a speed test result the GPU is preferred.
+  - *NVENC* / *AMD* / *CPU* – always use that one.
+  - *GPU + CPU* – with several videos two are converted at the same time, one on the graphics
+    card and one on the processor. A single video still uses the GPU only.
+- **Built-in update.** At every start the program looks for a newer release on GitHub, shows
+  the changes and asks whether to install it (`Y` install and restart, `N` not now, `S` skip
+  this version). The previous file is kept as `YT-DLP Interface.bat.bak`. The check can be
+  switched off in Settings (key `W`) and started by hand with Tools → `U`.
+
+### Notes
+- The built-in update works from this version on. Version 2.4 and older have to be replaced
+  by hand once.
+
 ## 2.4
 
 ### New
